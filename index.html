@@ -1,22 +1,485 @@
-\<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#020617" /> <!-- slate-950 to match the app background -->
-    <title>J.A.R.V.I.S. Neural Interface</title>
-    <style>
-      /* Pre-load background to prevent white flash before React loads */
-      body {
-        background-color: #020617; /* Tailwind slate-950 */
-        margin: 0;
-        padding: 0;
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Terminal, 
+  Mic, 
+  Image as ImageIcon, 
+  Send, 
+  Volume2, 
+  Power, 
+  Shield, 
+  Search, 
+  FileText, 
+  Cpu, 
+  Zap, 
+  Activity,
+  Target,
+  BrainCircuit,
+  Globe,
+  Key
+} from 'lucide-react';
+
+// Safely fetch API key from environment variables (Standard for GitHub/Vite local setups)
+let envApiKey = "";
+try {
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_GEMINI_API_KEY) {
+    envApiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  }
+} catch (e) {
+  // Ignore errors in environments that don't support import.meta
+}
+
+const apiKey = envApiKey || ""; // Environment provides this at runtime
+
+export default function App() {
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([
+    { role: 'assistant', content: 'J.A.R.V.I.S. Multimodal System Online. Neural pathways active. Standing by, sir.' }
+  ]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [image, setImage] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  
+  // Clear the custom API key by default. Custom public keys often return a 404 
+  // because they don't have access to the specific preview models used in this environment.
+  const [customApiKey, setCustomApiKey] = useState('');
+  const activeApiKey = customApiKey || apiKey;
+
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  // --- API Utilities ---
+  
+  const callGemini = async (chatHistory, currentPrompt, imageData = null, systemInstructions = null) => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${activeApiKey}`;
+    
+    // Format history for Gemini (excluding the initial system greeting for cleaner context)
+    const contents = chatHistory.slice(1).map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    }));
+
+    // Add the new user message
+    let currentParts = [{ 
+      text: webSearchEnabled 
+        ? `${currentPrompt}\n\n[SYSTEM DIRECTIVE: Utilize real-time Google Search to verify current data if applicable.]` 
+        : currentPrompt 
+    }];
+    if (imageData) {
+      currentParts.push({ inlineData: { mimeType: "image/png", data: imageData.split(',')[1] } });
+    }
+    contents.push({ role: "user", parts: currentParts });
+
+    const payload = {
+      contents,
+      systemInstruction: {
+        parts: [{ text: systemInstructions || "You are J.A.R.V.I.S., a sophisticated AI. You are helpful, witty, and concise. Speak like the JARVIS from the Iron Man films. You can handle text, images, and tools. Always confirm actions you would take on a Mac system (simulated)." }]
+      },
+      tools: [{ "google_search": {} }]
+    };
+
+    const response = await fetchWithRetry(url, payload);
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No actionable response generated, sir.";
+    
+    // Extract live internet sources from Grounding Metadata
+    let sources = [];
+    if (result.candidates?.[0]?.groundingMetadata?.groundingAttributions) {
+      sources = result.candidates[0].groundingMetadata.groundingAttributions
+        .map(a => ({ uri: a.web?.uri, title: a.web?.title }))
+        .filter(s => s.uri && s.title);
+        
+      // Deduplicate sources
+      sources = sources.filter((s, index, self) => 
+        index === self.findIndex((t) => t.uri === s.uri)
+      );
+    }
+
+    return { text, sources };
+  };
+
+  const speakText = async (text) => {
+    if (!voiceEnabled) return;
+    
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${activeApiKey}`;
+    const payload = {
+      contents: [{ parts: [{ text: `Say smoothly: ${text}` }] }],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } }
+        }
+      },
+      model: "gemini-2.5-flash-preview-tts"
+    };
+
+    try {
+      const response = await fetchWithRetry(url, payload);
+      const result = await response.json();
+      const audioData = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (audioData) {
+        playPCM(audioData);
       }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+    } catch (e) {
+      console.error("TTS Error", e);
+    }
+  };
+
+  const fetchWithRetry = async (url, payload, retries = 5) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) return res;
+        
+        // Fail fast for authentication or bad request errors to prevent 30-second hanging
+        const errorData = await res.json().catch(() => ({}));
+        if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) {
+            let errorMsg = errorData?.error?.message || `HTTP ${res.status}`;
+            if (res.status === 404) {
+                errorMsg += " (Model Not Found: If using a custom API key, it likely lacks access to these preview models. Please clear the key input.)";
+            }
+            throw new Error(errorMsg);
+        }
+        throw new Error(`HTTP ${res.status}`);
+      } catch (e) {
+        // Do not retry on explicit auth/request errors
+        if (i === retries - 1 || e.message.includes('400') || e.message.includes('401') || e.message.includes('403') || e.message.includes('404')) throw e;
+      }
+      await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+    }
+  };
+
+  const playPCM = (base64Data) => {
+    const binaryString = window.atob(base64Data);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+    
+    const sampleRate = 24000;
+    const wavHeader = new ArrayBuffer(44);
+    const view = new DataView(wavHeader);
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 32 + bytes.length, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, bytes.length, true);
+
+    const blob = new Blob([wavHeader, bytes], { type: 'audio/wav' });
+    const audioUrl = URL.createObjectURL(blob);
+    const audio = new Audio(audioUrl);
+    audio.play();
+  };
+
+  // --- Specialized Gemini LLM Features ---
+
+  const generateStrategicPlan = async () => {
+    if (!input.trim() && messages.length < 2) return;
+    
+    setIsProcessing(true);
+    const currentContext = input || messages[messages.length - 1].content;
+    const prompt = `Based on the following objective, create a multi-phase tactical plan with clear milestones: "${currentContext}"`;
+    const sysPrompt = "You are J.A.R.V.I.S. serving Tony Stark. Provide a highly organized, professional, and strategic breakdown. Use bullet points and bold headers.";
+    
+    try {
+      const response = await callGemini([], prompt, null, sysPrompt);
+      setMessages(prev => [...prev, { role: 'assistant', content: `✨ Strategic Plan Compiled:\n\n${response.text}`, sources: response.sources }]);
+      speakText("Strategic plan compiled and ready for review, sir.");
+    } catch (e) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: 'assistant', content: `Failed to compile plan: ${e.message}` }]);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const runDiagnostic = async () => {
+    setIsProcessing(true);
+    const history = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+    const prompt = `Analyze our current conversation history and provide a summary diagnostic of our current status and three suggested next steps: \n\n${history}`;
+    const sysPrompt = "You are J.A.R.V.I.S. running a system diagnostic. Be analytical, slightly humorous, and highly efficient. Provide a 'System Status' report.";
+    
+    try {
+      const response = await callGemini([], prompt, null, sysPrompt);
+      setMessages(prev => [...prev, { role: 'assistant', content: `✨ System Diagnostic:\n\n${response.text}`, sources: response.sources }]);
+      speakText("Diagnostic complete. All systems are within acceptable parameters, sir.");
+    } catch (e) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: 'assistant', content: `Diagnostic failed: ${e.message}` }]);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // --- Handlers ---
+
+  const handleSend = async () => {
+    if (!input.trim() && !image) return;
+
+    const userMessage = { role: 'user', content: input, image: imagePreview };
+    const newMessages = [...messages, userMessage];
+    setMessages(newMessages);
+    const currentInput = input;
+    setInput('');
+    setIsProcessing(true);
+
+    try {
+      const response = await callGemini(messages, currentInput || "Analyze this image, sir.", imagePreview);
+      setMessages([...newMessages, { role: 'assistant', content: response.text, sources: response.sources }]);
+      speakText(response.text);
+    } catch (error) {
+      console.error(error);
+      setMessages([...newMessages, { role: 'assistant', content: `System Error: ${error.message}` }]);
+    } finally {
+      setIsProcessing(false);
+      setImage(null);
+      setImagePreview(null);
+    }
+  };
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImagePreview(reader.result);
+      };
+      reader.readAsDataURL(file);
+      setImage(file);
+    }
+  };
+
+  const toggleSpeech = () => {
+    if (isListening) {
+      window.recognition?.stop();
+      setIsListening(false);
+    } else {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.lang = 'en-US';
+        recognition.onresult = (event) => {
+          const transcript = event.results[0][0].transcript;
+          setInput(transcript);
+          setIsListening(false);
+        };
+        recognition.start();
+        setIsListening(true);
+        window.recognition = recognition;
+      }
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-cyan-400 font-mono flex flex-col p-4 md:p-8">
+      {/* Header */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 border-b border-cyan-900 pb-4 gap-4">
+        <div className="flex items-center gap-3">
+          <div className="relative">
+            <Cpu className="w-8 h-8 animate-pulse text-cyan-500" />
+            <div className="absolute inset-0 bg-cyan-500 blur-lg opacity-20 animate-pulse"></div>
+          </div>
+          <div>
+            <h1 className="text-xl font-bold tracking-widest uppercase flex items-center gap-2">
+              J.A.R.V.I.S. <span className="text-[10px] bg-cyan-900/50 px-2 py-0.5 rounded border border-cyan-500/30">Gemini Core</span>
+            </h1>
+            <p className="text-xs text-cyan-700">Multimodal Neural Interface v2.5</p>
+          </div>
+        </div>
+        <div className="flex gap-4 items-center flex-wrap">
+          <button 
+            onClick={runDiagnostic}
+            disabled={isProcessing}
+            className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 border border-cyan-700/50 rounded-lg text-[10px] hover:bg-cyan-900/20 transition-all uppercase"
+          >
+            <Activity className="w-3 h-3" /> ✨ Diagnostic
+          </button>
+          <button 
+            onClick={generateStrategicPlan}
+            disabled={isProcessing}
+            className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 border border-cyan-700/50 rounded-lg text-[10px] hover:bg-cyan-900/20 transition-all uppercase"
+          >
+            <Target className="w-3 h-3" /> ✨ Tactical Plan
+          </button>
+          <button 
+            onClick={() => setWebSearchEnabled(!webSearchEnabled)}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] transition-all uppercase border ${webSearchEnabled ? 'bg-cyan-900/50 border-cyan-500/50 text-cyan-400' : 'bg-slate-900 border-cyan-700/50 text-slate-500'}`}
+          >
+            <Globe className="w-3 h-3" /> {webSearchEnabled ? 'Live Web' : 'Offline'}
+          </button>
+          <button 
+            onClick={() => setVoiceEnabled(!voiceEnabled)}
+            className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-cyan-900/50 text-cyan-400' : 'bg-slate-900 text-slate-600'}`}
+          >
+            <Volume2 className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Terminal Area */}
+      <div className="flex-1 overflow-hidden flex flex-col bg-slate-900/40 border border-cyan-900/30 rounded-lg shadow-[0_0_50px_-12px_rgba(6,182,212,0.15)] relative">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-6 scrollbar-thin scrollbar-thumb-cyan-900">
+          {messages.map((m, i) => (
+            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`max-w-[90%] md:max-w-[80%] ${m.role === 'user' ? 'bg-cyan-900/20' : 'bg-slate-800/40'} rounded-lg p-4 border ${m.role === 'user' ? 'border-cyan-700/50' : 'border-slate-700/50 shadow-[inset_0_0_20px_rgba(6,182,212,0.05)]'}`}>
+                {m.image && (
+                  <img src={m.image} alt="User upload" className="max-w-full h-auto rounded mb-3 border border-cyan-800" />
+                )}
+                <div className="flex items-start gap-3">
+                  {m.role === 'assistant' && <Shield className="w-4 h-4 mt-1 flex-shrink-0 text-cyan-500" />}
+                  <div className="w-full">
+                    <div className="text-sm leading-relaxed whitespace-pre-wrap overflow-x-auto">
+                      {m.content}
+                    </div>
+                    {m.sources && m.sources.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-cyan-800/50">
+                        <p className="text-[10px] text-cyan-600 mb-2 uppercase tracking-wider flex items-center gap-1">
+                          <Globe className="w-3 h-3" /> Live Network Sources
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {m.sources.map((source, idx) => (
+                            <a 
+                              key={idx} 
+                              href={source.uri} 
+                              target="_blank" 
+                              rel="noopener noreferrer" 
+                              className="text-[10px] text-cyan-400 bg-cyan-950/80 border border-cyan-800 px-2 py-1 rounded hover:bg-cyan-900 transition-colors flex items-center max-w-[250px]"
+                            >
+                              <span className="truncate">{source.title || source.uri}</span>
+                            </a>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+          {isProcessing && (
+            <div className="flex justify-start">
+              <div className="bg-slate-800/40 rounded-lg p-4 border border-slate-700/50 flex gap-2 items-center">
+                <BrainCircuit className="w-4 h-4 animate-spin text-cyan-500" />
+                <span className="text-xs uppercase tracking-widest text-cyan-700">
+                  {webSearchEnabled ? 'Accessing Global Network & Synthesizing...' : 'Synthesizing...'}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Action Bar (Tools Display) */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 p-2 border-t border-cyan-900/30 bg-slate-950/50 text-[10px] uppercase">
+          <div className={`flex items-center gap-2 justify-center py-1 rounded border ${webSearchEnabled ? 'bg-cyan-900/40 border-cyan-500/50 text-cyan-300 shadow-[0_0_10px_rgba(6,182,212,0.2)]' : 'bg-slate-900/50 border-cyan-900/20 text-cyan-700'}`}>
+            <Search className="w-3 h-3" /> {webSearchEnabled ? 'Google Search Active' : 'Search Offline'}
+          </div>
+          <div className="flex items-center gap-2 justify-center py-1 bg-slate-900/50 rounded border border-cyan-900/20">
+            <ImageIcon className="w-3 h-3" /> ✨ Vision Pro
+          </div>
+          <div className="flex items-center gap-2 justify-center py-1 bg-slate-900/50 rounded border border-cyan-900/20">
+            <Zap className="w-3 h-3" /> LLM Accelerated
+          </div>
+          <div className="flex items-center gap-2 justify-center py-1 bg-slate-900/50 rounded border border-cyan-900/20">
+            <Volume2 className="w-3 h-3" /> ✨ Gemini TTS
+          </div>
+        </div>
+
+        {/* Input Area */}
+        <div className="p-4 bg-slate-950 border-t border-cyan-900/50">
+          {imagePreview && (
+            <div className="relative inline-block mb-4 group">
+              <img src={imagePreview} className="h-24 w-24 object-cover rounded border-2 border-cyan-500 shadow-[0_0_15px_rgba(6,182,212,0.5)]" />
+              <button 
+                onClick={() => {setImagePreview(null); setImage(null);}} 
+                className="absolute -top-2 -right-2 bg-red-900 text-white rounded-full w-6 h-6 text-sm flex items-center justify-center border border-red-500 group-hover:scale-110 transition-transform"
+              >
+                ×
+              </button>
+              <div className="absolute bottom-0 left-0 right-0 bg-cyan-900/80 text-[8px] p-1 text-center font-bold">✨ READY FOR VISION</div>
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <div className="flex gap-2">
+              <label className="cursor-pointer p-3 bg-slate-900 border border-cyan-900/50 rounded-lg hover:bg-cyan-900/20 transition-all hover:border-cyan-400 group">
+                <ImageIcon className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+              </label>
+              <button 
+                onClick={toggleSpeech}
+                className={`p-3 border rounded-lg transition-all ${isListening ? 'bg-red-900/30 border-red-500 animate-pulse' : 'bg-slate-900 border-cyan-900/50 hover:bg-cyan-900/20 hover:border-cyan-400 group'}`}
+              >
+                <Mic className={`w-5 h-5 ${isListening ? 'text-red-500' : ''} group-hover:scale-110 transition-transform`} />
+              </button>
+            </div>
+            
+            <div className="flex-1 relative">
+              <input 
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                placeholder={imagePreview ? "Ask about this image, sir..." : "Command entry, sir..."}
+                className="w-full bg-slate-900 border border-cyan-900/50 rounded-lg py-3 px-4 focus:outline-none focus:border-cyan-400 text-sm placeholder:text-cyan-900 transition-all"
+              />
+              <button 
+                onClick={handleSend}
+                disabled={isProcessing}
+                className="absolute right-2 top-1.5 p-1.5 bg-cyan-600 text-slate-950 rounded hover:bg-cyan-400 transition-colors disabled:opacity-50 disabled:bg-slate-700"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer Info with Secure Key Override */}
+      <div className="mt-4 flex flex-col md:flex-row justify-between items-center text-[10px] text-cyan-800 uppercase tracking-[0.2em] gap-2">
+        <div className="flex gap-4 items-center">
+          <span>OS: StarkOS v12.4</span>
+          <span>Security: High</span>
+        </div>
+        
+        {/* Secure Key Injection Field */}
+        <div className="flex items-center gap-2 bg-slate-900/50 px-3 py-1.5 rounded border border-cyan-900/30">
+          <Key className="w-3 h-3 text-cyan-700" />
+          <input
+            type="password"
+            placeholder="OVERRIDE API KEY..."
+            value={customApiKey}
+            onChange={(e) => setCustomApiKey(e.target.value)}
+            className="bg-transparent focus:outline-none text-cyan-500 placeholder:text-cyan-900/50 w-36 md:w-48 tracking-widest"
+          />
+        </div>
+        
+        <span className="hidden md:inline">Latent space connection established</span>
+      </div>
+
+      {/* Background HUD Elements */}
+      <div className="fixed bottom-4 right-4 opacity-5 pointer-events-none select-none -z-10">
+        <Power className="w-48 h-48" />
+      </div>
+    </div>
+  );
+}
